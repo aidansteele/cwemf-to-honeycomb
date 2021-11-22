@@ -1,0 +1,262 @@
+Transform: AWS::Serverless-2016-10-31
+
+Parameters:
+  RoleName:
+    Type: String
+    Default: CloudWatchEMFToHoneycomb
+  BusName:
+    Type: String
+    Default: CloudWatchEMFToHoneycomb
+  DestinationName:
+    Type: String
+    Default: CloudWatchEMFToHoneycomb
+  HoneycombDataset:
+    Type: String
+  HoneycombKey:
+    Type: String
+
+Globals:
+  Function:
+    Runtime: provided.al2
+    Architectures: [arm64]
+    AutoPublishAlias: live
+    Handler: unused
+    MemorySize: 640
+    Layers:
+      - !Sub arn:aws:lambda:${AWS::Region}:580247275435:layer:LambdaInsightsExtension-Arm64:1
+
+Resources:
+  Sample:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ./lambdas/sample/bootstrap
+
+  Bus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: !Ref BusName
+
+  BackfillListEnvironments:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ./lambdas/backfill/bootstrap
+      Handler: ListEnvironments
+      Timeout: 60
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: organizations:ListAccounts
+              Resource: "*"
+
+  BackfillSubscribeGroups:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ./lambdas/backfill/bootstrap
+      Handler: SubscribeGroups
+      Timeout: 60
+      Environment:
+        Variables:
+          ROLE_NAME: !Ref RoleName
+          DESTINATION_NAME: !Ref DestinationName
+          DESTINATION_ACCOUNT_ID: !Ref AWS::AccountId
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: sts:AssumeRole
+              Resource: !Sub arn:aws:iam::*:role/${RoleName}
+
+  Backfill:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: !Sub ${AWS::StackName}Backfill
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName: ""
+      Definition:
+        StartAt: ListEnvironments
+        States:
+          ListEnvironments:
+            Type: Task
+            Resource: !Ref BackfillListEnvironments.Alias
+            Next: ForEachEnvironment
+          ForEachEnvironment:
+            Type: Map
+            ItemsPath: $.Environments
+            End: true
+            Iterator:
+              StartAt: SubscribeGroups
+              States:
+                SubscribeGroups:
+                  Type: Task
+                  Resource: !Ref BackfillSubscribeGroups.Alias
+                  Next: CheckIfComplete
+                  Retry:
+                    - ErrorEquals: [States.ALL]
+                      IntervalSeconds: 1
+                      MaxAttempts: 5
+                      BackoffRate: 2
+                CheckIfComplete:
+                  Type: Choice
+                  Choices:
+                    - Variable: $.NextToken
+                      IsPresent: true
+                      Next: SubscribeGroups
+                  Default: Done
+                Done:
+                  Type: Succeed
+
+  Subscriber:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ./lambdas/subscriber/bootstrap
+      Timeout: 15
+      Environment:
+        Variables:
+          ROLE_NAME: !Ref RoleName
+          DESTINATION_NAME: !Ref DestinationName
+          DESTINATION_ACCOUNT_ID: !Ref AWS::AccountId
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: sts:AssumeRole
+              Resource: !Sub arn:aws:iam::*:role/${RoleName}
+      Events:
+        NewLogGroup:
+          Type: EventBridgeRule
+          Properties:
+            EventBusName: !Ref Bus
+            Pattern:
+              source: [aws.logs]
+              detail-type: [AWS API Call via CloudTrail]
+              detail:
+                eventName: [CreateLogGroup]
+
+  Bucket:
+    DeletionPolicy: Retain
+    Type: AWS::S3::Bucket
+    Properties:
+      VersioningConfiguration:
+        Status: Enabled
+
+  Publisher:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ./lambdas/publisher/bootstrap
+      Timeout: 15
+      Environment:
+        Variables:
+          DATASET: !Ref HoneycombDataset
+          TEAM_KEY: !Ref HoneycombKey
+      Events:
+        NewObject:
+          Type: S3
+          Properties:
+            Bucket: !Ref Bucket
+            Events: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: honeycomb/
+
+  # this breaks the circular dependency between the bucket and the
+  # function (due to notifications configuration)
+  PublisherS3Policy:
+    Type: AWS::IAM::Policy
+    Properties:
+      Roles: [!Ref PublisherRole]
+      PolicyName: AllowPublisherS3Read
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Action:
+              - s3:GetBucketLocation
+              - s3:ListBucket
+              - s3:GetObject
+            Resource:
+              - !Sub arn:aws:s3:::${Bucket}
+              - !Sub arn:aws:s3:::${Bucket}/*
+
+  Transformer:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ./lambdas/transformer/bootstrap
+      Timeout: 15
+
+  Firehose:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      DeliveryStreamType: DirectPut
+      ExtendedS3DestinationConfiguration:
+        BucketARN: !Sub arn:aws:s3:::${Bucket}
+        RoleARN: !GetAtt FirehoseRole.Arn
+        Prefix: honeycomb/!{timestamp:yyyy/MM/dd}/
+        ErrorOutputPrefix: errors/!{firehose:error-output-type}/!{timestamp:yyyy/MM/dd}/
+        CompressionFormat: GZIP
+        BufferingHints:
+          IntervalInSeconds: 60
+          SizeInMBs: 128
+        ProcessingConfiguration:
+          Enabled: true
+          Processors:
+            - Type: Lambda
+              Parameters:
+                - ParameterName: LambdaArn
+                  ParameterValue: !Ref Transformer.Alias
+                - ParameterName: BufferSizeInMBs
+                  ParameterValue: "1"
+                - ParameterName: BufferIntervalInSeconds
+                  ParameterValue: "60"
+                - ParameterName: RoleArn
+                  ParameterValue: !GetAtt FirehoseRole.Arn
+
+  FirehoseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                sts:ExternalId: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: Firehose
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:AbortMultipartUpload
+                  - s3:GetBucketLocation
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:ListBucketMultipartUploads
+                  - s3:PutObject
+                Resource:
+                  - !Sub arn:aws:s3:::${Bucket}
+                  - !Sub arn:aws:s3:::${Bucket}/*
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !Ref Transformer.Alias
+
+Outputs:
+  BusArn:
+    Value: !GetAtt Bus.Arn
+  FirehoseArn:
+    Value: !GetAtt Firehose.Arn
+  Sample:
+    Value: !Ref Sample.Version
+  BackfillListEnvironments:
+    Value: !Ref BackfillListEnvironments.Version
+  BackfillSubscribeGroups:
+    Value: !Ref BackfillSubscribeGroups.Version
+  Subscriber:
+    Value: !Ref Subscriber.Version
+  Transformer:
+    Value: !Ref Transformer.Version
+  Publisher:
+    Value: !Ref Publisher.Version

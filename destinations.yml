@@ -1,0 +1,49 @@
+Parameters:
+  FirehoseArn:
+    Type: String
+  DestinationName:
+    Type: String
+    Default: CloudWatchEMFToHoneycomb
+
+Resources:
+  Destination:
+    Type: AWS::Logs::Destination
+    Properties:
+      DestinationName: !Ref DestinationName
+      RoleArn: !GetAtt DestinationRole.Arn
+      TargetArn: !Ref FirehoseArn
+      DestinationPolicy: >
+        {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Action": "logs:PutSubscriptionFilter",
+              "Resource": "*",
+              "Principal": {
+                "AWS": [
+                   "000000000000",
+                 ]
+              }
+            }
+          ]
+        }
+
+  DestinationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: sts:AssumeRole
+            Principal:
+              Service: logs.amazonaws.com
+      Policies:
+        - PolicyName: PutKinesis
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: firehose:PutRecord*
+                Resource: !Ref FirehoseArn

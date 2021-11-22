@@ -1,0 +1,12 @@
+version = 0.1
+[default]
+[default.deploy]
+[default.deploy.parameters]
+stack_name = "cwemf-to-honeycomb"
+s3_bucket = "aws-sam-cli-managed-default-samclisourcebucket-ywzgcf4cwavj"
+s3_prefix = "cwemf-to-honeycomb"
+region = "ap-southeast-2"
+confirm_changeset = true
+capabilities = ["CAPABILITY_IAM", "CAPABILITY_NAMED_IAM", "CAPABILITY_AUTO_EXPAND"]
+parameter_overrides = "DeploymentTarget=\"r-e0n4\" CallAs=\"SELF\" Regions=\"ap-southeast-2,us-west-2,us-east-1\""
+image_repositories = []

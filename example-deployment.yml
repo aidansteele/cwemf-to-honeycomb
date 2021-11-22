@@ -1,0 +1,140 @@
+Parameters:
+  DeploymentTarget:
+    Type: String
+    Default: r-e0n4
+  CallAs:
+    Type: String
+    AllowedValues: [SELF, DELEGATED_ADMIN]
+  Regions:
+    Type: List<String>
+    Default: ap-southeast-2,us-west-2,us-east-1
+  HoneycombDataset:
+    Type: String
+    Default: cwemf
+  HoneycombKey:
+    Type: String
+
+Resources:
+  Central:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: ./central.yml
+      Parameters:
+        HoneycombDataset: !Ref HoneycombDataset
+        HoneycombKey: !Ref HoneycombKey
+
+  OrgwideRoot:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: ./orgwide.yml
+      Parameters:
+        CentralBusAccountId: !Ref AWS::AccountId
+        CentralBusArn: !GetAtt Central.Outputs.BusArn
+        RoleRegion: !Select [0, !Ref Regions]
+
+  Orgwide:
+    Type: AWS::CloudFormation::StackSet
+    Properties:
+      StackSetName: !Ref AWS::StackName
+      # TODO: i wish this was supported by SAM CLI: https://github.com/aws/aws-sam-cli/issues/2249
+#      TemplateURL: ./orgwide.yml
+      Parameters:
+        - ParameterKey: CentralBusAccountId
+          ParameterValue: !Ref AWS::AccountId
+        - ParameterKey: CentralBusArn
+          ParameterValue: !GetAtt Central.Outputs.BusArn
+        - ParameterKey: RoleRegion
+          ParameterValue: !Select [0, !Ref Regions]
+      CallAs: !Ref CallAs
+      PermissionModel: SERVICE_MANAGED
+      AutoDeployment:
+        Enabled: true
+        RetainStacksOnAccountRemoval: false
+      Capabilities:
+        - CAPABILITY_IAM
+        - CAPABILITY_NAMED_IAM
+      OperationPreferences:
+        MaxConcurrentPercentage: 100
+        RegionConcurrencyType: PARALLEL
+      StackInstancesGroup:
+        - Regions: !Ref Regions
+          DeploymentTargets:
+            OrganizationalUnitIds: [!Ref DeploymentTarget]
+      TemplateBody: |
+        Parameters:
+          CentralBusAccountId:
+            Type: String
+          CentralBusArn:
+            Type: String
+          RoleName:
+            Type: String
+            Default: CloudWatchEMFToHoneycomb
+          RoleRegion:
+            Type: String
+
+        Conditions:
+          CreateRole: !Equals [!Ref RoleRegion, !Ref "AWS::Region"]
+
+        Resources:
+          NewLogGroupEventRule:
+            Type: AWS::Events::Rule
+            Properties:
+              EventPattern:
+                source: [aws.logs]
+                detail-type: [AWS API Call via CloudTrail]
+                detail:
+                  eventName: [CreateLogGroup]
+              Targets:
+                - Id: central-bus
+                  Arn: !Ref CentralBusArn
+                  RoleArn: !GetAtt NewLogGroupEventRole.Arn
+
+          NewLogGroupEventRole:
+            Type: AWS::IAM::Role
+            Properties:
+              AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                  - Effect: Allow
+                    Action: sts:AssumeRole
+                    Principal:
+                      Service: events.amazonaws.com
+              Policies:
+                - PolicyName: PutEventsOnCentralBus
+                  PolicyDocument:
+                    Version: "2012-10-17"
+                    Statement:
+                      - Effect: Allow
+                        Action: events:PutEvents
+                        Resource: !Ref CentralBusArn
+
+          SubscriberRole:
+            Type: AWS::IAM::Role
+            Condition: CreateRole
+            Properties:
+              RoleName: !Ref RoleName
+              AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                  - Effect: Allow
+                    Action: sts:AssumeRole
+                    Principal:
+                      AWS: !Ref CentralBusAccountId
+              Policies:
+                - PolicyName: Subscriber
+                  PolicyDocument:
+                    Version: "2012-10-17"
+                    Statement:
+                      - Effect: Allow
+                        Action:
+                          - logs:PutSubscriptionFilter
+                          - logs:DeleteSubscriptionFilter
+                          - logs:DescribeSubscriptionFilters
+                          - logs:DescribeLogGroups
+                        Resource: "*"
+
+Outputs:
+  BusArn:
+    Value: !GetAtt Central.Outputs.BusArn
+  FirehoseArn:
+    Value: !GetAtt Central.Outputs.FirehoseArn

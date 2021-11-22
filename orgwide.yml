@@ -1,0 +1,71 @@
+Parameters:
+  CentralBusAccountId:
+    Type: String
+  CentralBusArn:
+    Type: String
+  RoleName:
+    Type: String
+    Default: CloudWatchEMFToHoneycomb
+  RoleRegion:
+    Type: String
+
+Conditions:
+  CreateRole: !Equals [!Ref RoleRegion, !Ref "AWS::Region"]
+
+Resources:
+  NewLogGroupEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      EventPattern:
+        source: [aws.logs]
+        detail-type: [AWS API Call via CloudTrail]
+        detail:
+          eventName: [CreateLogGroup]
+      Targets:
+        - Id: central-bus
+          Arn: !Ref CentralBusArn
+          RoleArn: !GetAtt NewLogGroupEventRole.Arn
+
+  NewLogGroupEventRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: sts:AssumeRole
+            Principal:
+              Service: events.amazonaws.com
+      Policies:
+        - PolicyName: PutEventsOnCentralBus
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: events:PutEvents
+                Resource: !Ref CentralBusArn
+
+  SubscriberRole:
+    Type: AWS::IAM::Role
+    Condition: CreateRole
+    Properties:
+      RoleName: !Ref RoleName
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: sts:AssumeRole
+            Principal:
+              AWS: !Ref CentralBusAccountId
+      Policies:
+        - PolicyName: Subscriber
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:PutSubscriptionFilter
+                  - logs:DeleteSubscriptionFilter
+                  - logs:DescribeSubscriptionFilters
+                  - logs:DescribeLogGroups
+                Resource: "*"
